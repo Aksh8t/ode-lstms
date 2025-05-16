@@ -2,9 +2,9 @@
 
 import torch
 import torch.nn as nn
-from torchdyn.models import NeuralDE
+from torchdyn.core import NeuralDE  # Changed from torchdyn.models
 import pytorch_lightning as pl
-from pytorch_lightning.metrics.functional import accuracy
+from torchmetrics.functional import accuracy
 
 
 class ODELSTMCell(nn.Module):
@@ -22,16 +22,16 @@ class ODELSTMCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         if not self.fixed_step_solver:
-            self.node = NeuralDE(self.f_node, solver=solver_type)
+            self.node = NeuralDE(self.f_node, solver=solver_type, sensitivity='adjoint')
         else:
             options = {
                 "fixed_euler": self.euler,
                 "fixed_heun": self.heun,
                 "fixed_rk4": self.rk4,
             }
-            if not solver_type in options.keys():
-                raise ValueError("Unknown solver type '{:}'".format(solver_type))
-            self.node = options[self.solver_type]
+            if solver_type not in options:
+                raise ValueError(f"Unknown solver type '{solver_type}'")
+            self.node = options[solver_type]
 
     def forward(self, input, hx, ts):
         new_h, new_c = self.lstm(input, hx)
@@ -51,7 +51,7 @@ class ODELSTMCell(nn.Module):
 
     def solve_fixed(self, x, ts):
         ts = ts.view(-1, 1)
-        for i in range(3):  # 3 unfolds
+        for _ in range(3):  # 3 unfolds
             x = self.node(x, ts * (1.0 / 3))
         return x
 
@@ -69,7 +69,6 @@ class ODELSTMCell(nn.Module):
         k2 = self.f_node(y + k1 * delta_t * 0.5)
         k3 = self.f_node(y + k2 * delta_t * 0.5)
         k4 = self.f_node(y + k3 * delta_t)
-
         return y + delta_t * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
 
 
@@ -101,22 +100,21 @@ class ODELSTM(nn.Module):
         ]
         outputs = []
         last_output = torch.zeros((batch_size, self.out_feature), device=device)
+        
         for t in range(seq_len):
             inputs = x[:, t]
             ts = timespans[:, t].squeeze()
-            hidden_state = self.rnn_cell.forward(inputs, hidden_state, ts)
+            hidden_state = self.rnn_cell(inputs, hidden_state, ts)
             current_output = self.fc(hidden_state[0])
             outputs.append(current_output)
+            
             if mask is not None:
                 cur_mask = mask[:, t].view(batch_size, 1)
                 last_output = cur_mask * current_output + (1.0 - cur_mask) * last_output
             else:
                 last_output = current_output
-        if self.return_sequences:
-            outputs = torch.stack(outputs, dim=1)  # return entire sequence
-        else:
-            outputs = last_output  # only last item
-        return outputs
+                
+        return torch.stack(outputs, dim=1) if self.return_sequences else last_output
 
 
 class IrregularSequenceLearner(pl.LightningModule):
@@ -124,6 +122,7 @@ class IrregularSequenceLearner(pl.LightningModule):
         super().__init__()
         self.model = model
         self.lr = lr
+        self.save_hyperparameters(ignore=['model'])
 
     def training_step(self, batch, batch_idx):
         if len(batch) == 4:
@@ -131,15 +130,18 @@ class IrregularSequenceLearner(pl.LightningModule):
         else:
             x, t, y = batch
             mask = None
-        y_hat = self.model.forward(x, t, mask)
+            
+        y_hat = self.model(x, t, mask)
         y_hat = y_hat.view(-1, y_hat.size(-1))
         y = y.view(-1)
+        
         loss = nn.CrossEntropyLoss()(y_hat, y)
         preds = torch.argmax(y_hat.detach(), dim=-1)
-        acc = accuracy(preds, y)
-        self.log("train_acc", acc, prog_bar=True)
+        acc = accuracy(preds, y, task='multiclass', num_classes=self.model.out_feature)
+        
         self.log("train_loss", loss, prog_bar=True)
-        return {"loss": loss}
+        self.log("train_acc", acc, prog_bar=True)
+        return loss
 
     def validation_step(self, batch, batch_idx):
         if len(batch) == 4:
@@ -147,22 +149,21 @@ class IrregularSequenceLearner(pl.LightningModule):
         else:
             x, t, y = batch
             mask = None
-        y_hat = self.model.forward(x, t, mask)
+            
+        y_hat = self.model(x, t, mask)
         y_hat = y_hat.view(-1, y_hat.size(-1))
         y = y.view(-1)
-
+        
         loss = nn.CrossEntropyLoss()(y_hat, y)
-
         preds = torch.argmax(y_hat, dim=1)
-        acc = accuracy(preds, y)
-
+        acc = accuracy(preds, y, task='multiclass', num_classes=self.model.out_feature)
+        
         self.log("val_loss", loss, prog_bar=True)
         self.log("val_acc", acc, prog_bar=True)
         return loss
 
     def test_step(self, batch, batch_idx):
-        # Here we just reuse the validation_step for testing
         return self.validation_step(batch, batch_idx)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
