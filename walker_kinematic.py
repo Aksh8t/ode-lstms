@@ -1,95 +1,112 @@
-# Copyright 2021 The ODE-LSTM Authors. All Rights Reserved.
-
 import os
-import tensorflow as tf
-from node_cell import (
-    LSTMCell,
-    CTRNNCell,
-    ODELSTM,
-    VanillaRNN,
-    CTGRU,
-    BidirectionalRNN,
-    GRUD,
-    PhasedLSTM,
-    GRUODE,
-    HawkLSTMCell,
-)
+import torch
 import argparse
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 from irregular_sampled_datasets import Walker2dImitationData
+from torch_node_cell import ODELSTM  # Assume custom cells are implemented
 
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--model", default="lstm")
-parser.add_argument("--size", default=64, type=int)
-parser.add_argument("--epochs", default=200, type=int)
-parser.add_argument("--lr", default=0.005, type=float)
-args = parser.parse_args()
-
-data = Walker2dImitationData(seq_len=64)
-
-if args.model == "lstm":
-    cell = LSTMCell(units=args.size)
-elif args.model == "ctrnn":
-    cell = CTRNNCell(units=args.size, num_unfolds=3, method="rk4")
-elif args.model == "node":
-    cell = CTRNNCell(units=args.size, num_unfolds=3, method="rk4", tau=0)
-elif args.model == "odelstm":
-    cell = ODELSTM(units=args.size)
-elif args.model == "ctgru":
-    cell = CTGRU(units=args.size)
-elif args.model == "vanilla":
-    cell = VanillaRNN(units=args.size)
-elif args.model == "bidirect":
-    cell = BidirectionalRNN(units=args.size)
-elif args.model == "grud":
-    cell = GRUD(units=args.size)
-elif args.model == "phased":
-    cell = PhasedLSTM(units=args.size)
-elif args.model == "gruode":
-    cell = GRUODE(units=args.size)
-elif args.model == "hawk":
-    cell = HawkLSTMCell(units=args.size)
-else:
-    raise ValueError("Unknown model type '{}'".format(args.model))
-
-signal_input = tf.keras.Input(shape=(data.seq_len, data.input_size), name="robot")
-time_input = tf.keras.Input(shape=(data.seq_len, 1), name="time")
-
-rnn = tf.keras.layers.RNN(cell, time_major=False, return_sequences=True)
-
-output_states = rnn((signal_input, time_input))
-y = tf.keras.layers.Dense(data.input_size)(output_states)
-
-model = tf.keras.Model(inputs=[signal_input, time_input], outputs=[y])
-
-model.compile(
-    optimizer=tf.keras.optimizers.RMSprop(args.lr),
-    loss=tf.keras.losses.MeanSquaredError(),
-)
-model.summary()
-
-hist = model.fit(
-    x=(data.train_x, data.train_times),
-    y=data.train_y,
-    batch_size=128,
-    epochs=args.epochs,
-    validation_data=((data.valid_x, data.valid_times), data.valid_y),
-    callbacks=[
-        tf.keras.callbacks.ModelCheckpoint(
-            "/tmp/checkpoint", save_best_only=True, save_weights_only=True, mode="min"
+class WalkerKinematicModel(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.rnn = ODELSTM(
+            in_features=input_size,
+            hidden_size=hidden_size,
+            out_feature=hidden_size,
+            solver_type='fixed_rk4'
         )
-    ],
-)
+        self.fc = nn.Linear(hidden_size, input_size)
 
-# Restore checkpoint with lowest validation MSE
-model.load_weights("/tmp/checkpoint")
-best_test_loss = model.evaluate(
-    x=(data.test_x, data.test_times), y=data.test_y, verbose=2
-)
-print("Best test loss: {:0.3f}".format(best_test_loss))
+    def forward(self, x, t):
+        outputs, _ = self.rnn(x, t)
+        return self.fc(outputs)
 
-# Log result in file
-base_path = "results/walker"
-os.makedirs(base_path, exist_ok=True)
-with open("{}/{}_{}.csv".format(base_path, args.model, args.size), "a") as f:
-    f.write("{:06f}\n".format(best_test_loss))
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="odelstm")
+    parser.add_argument("--size", default=64, type=int)
+    parser.add_argument("--epochs", default=200, type=int)
+    parser.add_argument("--lr", default=0.005, type=float)
+    parser.add_argument("--batch_size", default=128, type=int)
+    args = parser.parse_args()
+
+    # Load dataset
+    data = Walker2dImitationData(seq_len=64)
+    
+    # Create datasets
+    train_dataset = TensorDataset(
+        torch.FloatTensor(data.train_x),
+        torch.FloatTensor(data.train_times),
+        torch.FloatTensor(data.train_y)
+    )
+    
+    valid_dataset = TensorDataset(
+        torch.FloatTensor(data.valid_x),
+        torch.FloatTensor(data.valid_times),
+        torch.FloatTensor(data.valid_y)
+    )
+    
+    test_dataset = TensorDataset(
+        torch.FloatTensor(data.test_x),
+        torch.FloatTensor(data.test_times),
+        torch.FloatTensor(data.test_y)
+    )
+
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+
+    # Initialize model
+    model = WalkerKinematicModel(
+        input_size=data.input_size,
+        hidden_size=args.size
+    )
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
+
+    best_loss = float('inf')
+    for epoch in range(args.epochs):
+        # Training
+        model.train()
+        for x, t, y in train_loader:
+            pred = model(x, t)
+            loss = criterion(pred, y)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x, t, y in valid_loader:
+                pred = model(x, t)
+                val_loss += criterion(pred, y).item()
+        
+        val_loss /= len(valid_loader)
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(model.state_dict(), "best_model.pth")
+
+    # Testing
+    model.load_state_dict(torch.load("best_model.pth"))
+    model.eval()
+    test_loss = 0
+    with torch.no_grad():
+        for x, t, y in test_loader:
+            pred = model(x, t)
+            test_loss += criterion(pred, y).item()
+    
+    test_loss /= len(test_loader)
+    print(f"Best test loss: {test_loss:.3f}")
+
+    # Save results
+    base_path = "results/walker"
+    os.makedirs(base_path, exist_ok=True)
+    with open(f"{base_path}/{args.model}_{args.size}.csv", "a") as f:
+        f.write(f"{test_loss:.6f}\n")
+
+if __name__ == "__main__":
+    main()

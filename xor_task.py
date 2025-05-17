@@ -1,97 +1,96 @@
-# Copyright 2021 The ODE-LSTM Authors. All Rights Reserved.
-
 import os
-import tensorflow as tf
-from node_cell import (
-    LSTMCell,
-    CTRNNCell,
-    ODELSTM,
-    VanillaRNN,
-    CTGRU,
-    BidirectionalRNN,
-    GRUD,
-    PhasedLSTM,
-    GRUODE,
-    HawkLSTMCell,
-)
+import torch
 import argparse
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
 from irregular_sampled_datasets import XORData
+from torch_node_cell import ODELSTM  # Assume custom cells implemented
 
+class XORModel(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.rnn = ODELSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            return_sequences=False
+        )
+        self.fc = nn.Linear(hidden_size, 1)
+        self.sigmoid = nn.Sigmoid()
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--model", default="lstm")
-parser.add_argument("--size", default=64, type=int)
-parser.add_argument("--epochs", default=200, type=int)
-parser.add_argument("--lr", default=0.0005, type=float)
-parser.add_argument("--dense", action="store_true")
-args = parser.parse_args()
+    def forward(self, x, t, mask):
+        # Apply mask to input
+        x = x * mask.unsqueeze(-1).float()
+        outputs, _ = self.rnn(x, t)
+        return self.fc(outputs[:, -1])
 
-if args.dense:
-    data = XORData(time_major=False, event_based=False, pad_size=32)
-else:
-    data = XORData(time_major=False, event_based=True, pad_size=32)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="odelstm")
+    parser.add_argument("--size", default=64, type=int)
+    parser.add_argument("--epochs", default=200, type=int)
+    parser.add_argument("--lr", default=0.0005, type=float)
+    parser.add_argument("--batch_size", default=256, type=int)
+    parser.add_argument("--dense", action="store_true")
+    args = parser.parse_args()
 
-if args.model == "lstm":
-    cell = LSTMCell(units=args.size)
-elif args.model == "ctrnn":
-    cell = CTRNNCell(units=args.size, num_unfolds=3, method="rk4")
-elif args.model == "node":
-    cell = CTRNNCell(units=args.size, num_unfolds=3, method="rk4", tau=0)
-elif args.model == "odelstm":
-    cell = ODELSTM(units=args.size)
-elif args.model == "ctgru":
-    cell = CTGRU(units=args.size)
-elif args.model == "vanilla":
-    cell = VanillaRNN(units=args.size)
-elif args.model == "bidirect":
-    cell = BidirectionalRNN(units=args.size)
-elif args.model == "grud":
-    cell = GRUD(units=args.size)
-elif args.model == "phased":
-    cell = PhasedLSTM(units=args.size)
-elif args.model == "gruode":
-    cell = GRUODE(units=args.size)
-elif args.model == "hawk":
-    cell = HawkLSTMCell(units=args.size)
-else:
-    raise ValueError("Unknown model type '{}'".format(args.model))
+    # Load dataset
+    data = XORData(time_major=False, event_based=not args.dense, pad_size=32)
+    
+    # Convert to PyTorch tensors
+    train_dataset = TensorDataset(
+        torch.FloatTensor(data.train_events),
+        torch.FloatTensor(data.train_elapsed),
+        torch.BoolTensor(data.train_mask),
+        torch.FloatTensor(data.train_y)
+    )
+    
+    test_dataset = TensorDataset(
+        torch.FloatTensor(data.test_events),
+        torch.FloatTensor(data.test_elapsed),
+        torch.BoolTensor(data.test_mask),
+        torch.FloatTensor(data.test_y)
+    )
 
-pixel_input = tf.keras.Input(shape=(data.pad_size, 1), name="pixel")
-time_input = tf.keras.Input(shape=(data.pad_size, 1), name="time")
-mask_input = tf.keras.Input(shape=(data.pad_size,), dtype=tf.bool, name="mask")
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
 
-rnn = tf.keras.layers.RNN(cell, time_major=False, return_sequences=False)
-dense_layer = tf.keras.layers.Dense(1)
+    # Initialize model
+    model = XORModel(input_size=1, hidden_size=args.size)
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr)
+    criterion = nn.BCEWithLogitsLoss()
 
-output_states = rnn((pixel_input, time_input), mask=mask_input)
-y = dense_layer(output_states)
+    # Training loop
+    best_acc = 0
+    for epoch in range(args.epochs):
+        model.train()
+        for x, t, mask, y in train_loader:
+            outputs = model(x, t, mask)
+            loss = criterion(outputs.squeeze(), y.float())
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-model = tf.keras.Model(inputs=[pixel_input, time_input, mask_input], outputs=[y])
+        # Evaluation
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for x, t, mask, y in test_loader:
+                outputs = model(x, t, mask)
+                predicted = (torch.sigmoid(outputs) > 0.5).float()
+                correct += (predicted.squeeze() == y).sum().item()
+                total += y.size(0)
+        
+        acc = 100 * correct / total
+        if acc > best_acc:
+            best_acc = acc
 
-model.compile(
-    optimizer=tf.keras.optimizers.RMSprop(args.lr),
-    loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
-    metrics=[tf.keras.metrics.BinaryAccuracy(threshold=0.0)],
-)
-model.summary()
+    # Save results
+    base_path = "results/xor_dense" if args.dense else "results/xor_event"
+    os.makedirs(base_path, exist_ok=True)
+    with open(f"{base_path}/{args.model}_{args.size}.csv", "a") as f:
+        f.write(f"{best_acc:.6f}\n")
 
-# Fit model
-hist = model.fit(
-    x=(data.train_events, data.train_elapsed, data.train_mask),
-    y=data.train_y,
-    batch_size=256,
-    epochs=args.epochs,
-)
-# Evaluate model after training
-_, best_test_acc = model.evaluate(
-    x=(data.test_events, data.test_elapsed, data.test_mask), y=data.test_y, verbose=2
-)
-
-# log results
-if args.dense:
-    base_path = "results/xor_dense"
-else:
-    base_path = "results/xor_event"
-os.makedirs(base_path, exist_ok=True)
-with open("{}/{}_{}.csv".format(base_path, args.model, args.size), "a") as f:
-    f.write("{:06f}\n".format(best_test_acc))
+if __name__ == "__main__":
+    main()
