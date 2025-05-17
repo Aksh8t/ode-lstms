@@ -1,8 +1,6 @@
-# Copyright 2021 The ODE-LSTM Authors. All Rights Reserved.
-
 import torch
 import torch.nn as nn
-from torchdyn.core import NeuralDE  # Changed from torchdyn.models
+from torchdyn.core import NeuralDE
 import pytorch_lightning as pl
 from torchmetrics.functional import accuracy
 
@@ -13,7 +11,6 @@ class ODELSTMCell(nn.Module):
         self.solver_type = solver_type
         self.fixed_step_solver = solver_type.startswith("fixed_")
         self.lstm = nn.LSTMCell(input_size, hidden_size)
-        # 1 hidden layer NODE
         self.f_node = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
@@ -21,6 +18,7 @@ class ODELSTMCell(nn.Module):
         )
         self.input_size = input_size
         self.hidden_size = hidden_size
+
         if not self.fixed_step_solver:
             self.node = NeuralDE(self.f_node, solver=solver_type, sensitivity='adjoint')
         else:
@@ -43,7 +41,6 @@ class ODELSTMCell(nn.Module):
             device = input.device
             s_sort = ts[indices]
             s_sort = s_sort + torch.linspace(0, 1e-4, batch_size, device=device)
-            # HACK: Make sure no two points are equal
             trajectory = self.node.trajectory(new_h, s_sort)
             new_h = trajectory[indices, torch.arange(batch_size, device=device)]
 
@@ -51,7 +48,7 @@ class ODELSTMCell(nn.Module):
 
     def solve_fixed(self, x, ts):
         ts = ts.view(-1, 1)
-        for _ in range(3):  # 3 unfolds
+        for _ in range(3):
             x = self.node(x, ts * (1.0 / 3))
         return x
 
@@ -73,14 +70,7 @@ class ODELSTMCell(nn.Module):
 
 
 class ODELSTM(nn.Module):
-    def __init__(
-        self,
-        in_features,
-        hidden_size,
-        out_feature,
-        return_sequences=True,
-        solver_type="dopri5",
-    ):
+    def __init__(self, in_features, hidden_size, out_feature, return_sequences=True, solver_type="dopri5"):
         super(ODELSTM, self).__init__()
         self.in_features = in_features
         self.hidden_size = hidden_size
@@ -100,20 +90,20 @@ class ODELSTM(nn.Module):
         ]
         outputs = []
         last_output = torch.zeros((batch_size, self.out_feature), device=device)
-        
+
         for t in range(seq_len):
             inputs = x[:, t]
             ts = timespans[:, t].squeeze()
             hidden_state = self.rnn_cell(inputs, hidden_state, ts)
             current_output = self.fc(hidden_state[0])
             outputs.append(current_output)
-            
+
             if mask is not None:
                 cur_mask = mask[:, t].view(batch_size, 1)
                 last_output = cur_mask * current_output + (1.0 - cur_mask) * last_output
             else:
                 last_output = current_output
-                
+
         return torch.stack(outputs, dim=1) if self.return_sequences else last_output
 
 
@@ -130,15 +120,15 @@ class IrregularSequenceLearner(pl.LightningModule):
         else:
             x, t, y = batch
             mask = None
-            
+
         y_hat = self.model(x, t, mask)
         y_hat = y_hat.view(-1, y_hat.size(-1))
         y = y.view(-1)
-        
+
         loss = nn.CrossEntropyLoss()(y_hat, y)
         preds = torch.argmax(y_hat.detach(), dim=-1)
         acc = accuracy(preds, y, task='multiclass', num_classes=self.model.out_feature)
-        
+
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_acc", acc, prog_bar=True)
         return loss
@@ -149,21 +139,37 @@ class IrregularSequenceLearner(pl.LightningModule):
         else:
             x, t, y = batch
             mask = None
-            
+
         y_hat = self.model(x, t, mask)
         y_hat = y_hat.view(-1, y_hat.size(-1))
         y = y.view(-1)
-        
+
         loss = nn.CrossEntropyLoss()(y_hat, y)
         preds = torch.argmax(y_hat, dim=1)
         acc = accuracy(preds, y, task='multiclass', num_classes=self.model.out_feature)
-        
+
         self.log("val_loss", loss, prog_bar=True)
         self.log("val_acc", acc, prog_bar=True)
-        return loss
+        return {"val_loss": loss, "val_acc": acc}
 
     def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
+        if len(batch) == 4:
+            x, t, y, mask = batch
+        else:
+            x, t, y = batch
+            mask = None
+
+        y_hat = self.model(x, t, mask)
+        y_hat = y_hat.view(-1, y_hat.size(-1))
+        y = y.view(-1)
+
+        loss = nn.CrossEntropyLoss()(y_hat, y)
+        preds = torch.argmax(y_hat, dim=1)
+        acc = accuracy(preds, y, task='multiclass', num_classes=self.model.out_feature)
+
+        self.log("test_loss", loss, prog_bar=True)
+        self.log("test_acc", acc, prog_bar=True)
+        return {"test_loss": loss, "test_acc": acc}
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
